@@ -1,0 +1,9 @@
+streamlit
+playwright
+fastapi
+uvicorn
+celery
+requests
+pandas
+beautifulsoup4
+pytest
