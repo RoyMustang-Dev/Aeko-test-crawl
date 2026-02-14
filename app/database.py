@@ -65,3 +65,20 @@ def get_all_pages(session_id):
     rows = c.fetchall()
     conn.close()
     return rows
+
+def get_latest_session_data(limit=50):
+    """Fetches pages from the most recent session."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    # Get latest session_id
+    c.execute("SELECT session_id FROM crawled_pages ORDER BY id DESC LIMIT 1")
+    result = c.fetchone()
+    if not result:
+        return []
+    
+    latest_sid = result["session_id"]
+    c.execute("SELECT * FROM crawled_pages WHERE session_id=? ORDER BY id ASC LIMIT ?", (latest_sid, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows

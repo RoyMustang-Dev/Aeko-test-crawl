@@ -1,14 +1,17 @@
 """
 Crawler Service Component.
 
-Refactored for High Performance:
+Refactored for High Performance & Reliability:
 
 FIXES APPLIED:
 1. URL-agnostic Smart Selection using entropy + similarity.
 2. Parallel DB Writer Queue (OPTION A).
 3. Thread-safe visited set via asyncio.Lock.
 4. Zero-lag persistence (workers never touch SQLite).
-5. Safe worker shutdown (no cancellation).
+5. Safe worker shutdown (stop event).
+6. Resource Blocking (Images/Fonts) for speed.
+7. Canonical URL handling (Redirects).
+8. Content Deduplication (Header/Footer removal).
 """
 
 import asyncio
@@ -30,6 +33,8 @@ class CrawlerService:
     def __init__(self):
         init_db()
         enable_wal()
+        self.allowed_links = []
+        self.blocked_links = []
 
     # ---------------- SMART URL SCORING (NO KEYWORDS) ---------------- #
 
@@ -85,9 +90,52 @@ class CrawlerService:
 
     def is_allowed(self, url, rp):
         try:
-            return rp.can_fetch("*", url)
+            allowed = rp.can_fetch("*", url)
+            return allowed
         except:
             return True
+
+    # ---------------- HELPERS ---------------- #
+
+    async def _close_popups(self, page: Page):
+        """Attempts to close common cookie banners and modals."""
+        selectors = [
+            "button[id*='cookie']", "button[class*='cookie']",
+            "button[id*='accept']", "button[class*='accept']",
+            "button[aria-label*='close']", ".modal-close", "div[aria-label*='cookie'] button",
+            "text=Accept All", "text=Agree", "text=No Thanks", "text=Accept"
+        ]
+        # Quick race to see if any exist, don't wait long
+        try:
+            for sel in selectors:
+                if await page.isVisible(sel, timeout=200):
+                    await page.click(sel, timeout=200)
+                    break
+        except:
+            pass
+
+    async def _handle_captcha(self, page: Page):
+        """Standardized captcha handling structure."""
+        # 1. Cloudflare Turnstile "Verify you are human" checkbox
+        try:
+            if await page.isVisible("iframe[src*='turnstile']", timeout=1000):
+                frames = page.frames
+                for f in frames:
+                    if "turnstile" in f.url:
+                        await f.click("body", timeout=500)
+                        await asyncio.sleep(1) # Wait for processing
+        except:
+            pass
+
+    def _clean_content(self, html: str) -> str:
+        """Removes headers, footers, navs to extract main content."""
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # Remove distractions
+        for tag in soup(["header", "footer", "nav", "aside", "script", "style", "noscript", "iframe"]):
+            tag.decompose()
+            
+        return soup.get_text(separator="\n", strip=True)
 
     # ---------------- ASYNC DB WRITER ---------------- #
 
@@ -107,17 +155,34 @@ class CrawlerService:
     # ---------------- WORKER ---------------- #
 
     async def _worker(self, wid, queue, context, session_id, rp,
-                      visited, visited_lock, db_queue, simulate):
+                      visited, visited_lock, db_queue, simulate, stop_event):
+
+        # Block resources for speed if not in simulation mode
+        if not simulate:
+            try:
+                await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,css,woff,woff2,ttf,mp4,webm,ad,ads}", lambda route: route.abort())
+            except:
+                pass
 
         page = await context.new_page()
 
-        while True:
-            item = await queue.get()
+        while not stop_event.is_set():
+            # Get item with timeout to check stop_event frequently
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            
             if item is None:
                 queue.task_done()
                 break
 
             url, depth, max_depth = item
+
+            # Check if stopped mid-work
+            if stop_event.is_set():
+                queue.task_done()
+                break
 
             async with visited_lock:
                 if url in visited:
@@ -126,22 +191,65 @@ class CrawlerService:
                 visited.add(url)
 
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                # RACE CONDITION: Navigate OR Stop
+                # We create a task for navigation so we can cancel it if stop is pressed first
+                nav_task = asyncio.create_task(page.goto(url, wait_until="domcontentloaded", timeout=20000))
+                stop_wait_task = asyncio.create_task(stop_event.wait())
+
+                done, pending = await asyncio.wait([nav_task, stop_wait_task], return_when=asyncio.FIRST_COMPLETED)
+
+                if stop_event.is_set():
+                    # Stop was pressed! Cancel navigation immediately.
+                    nav_task.cancel()
+                    try:
+                        await nav_task
+                    except asyncio.CancelledError:
+                        pass
+                    queue.task_done()
+                    break
+
+                # If we are here, navigation finished first
+                stop_wait_task.cancel()
+                await nav_task # Propagate exceptions if any
+
+                # Canonical URL (Handle Redirects e.g., Booking.com)
+                current_url = page.url
+                
+                # Check stop again before heavy processing
+                if stop_event.is_set():
+                    queue.task_done()
+                    break
+                
+                # Cleanup
+                await self._close_popups(page)
+                await self._handle_captcha(page)
+
                 title = await page.title()
-                content = await page.evaluate("document.body.innerText")
+                content_html = await page.content()
+                
+                # Check stop again
+                if stop_event.is_set():
+                    queue.task_done()
+                    break
 
-                # Async persistence (non-blocking)
-                await db_queue.put((session_id, url, title, content, depth, "success"))
+                # Deduplication & Extraction
+                clean_content = self._clean_content(content_html)
 
-                if depth < max_depth:
-                    soup = BeautifulSoup(await page.content(), "html.parser")
+                # Async persistence
+                await db_queue.put((session_id, current_url, title, clean_content, depth, "success"))
+
+                if depth < max_depth and not stop_event.is_set():
+                    soup = BeautifulSoup(content_html, "html.parser")
                     discovered = []
 
                     for a in soup.find_all("a", href=True):
-                        full = urljoin(url, a["href"])
-                        if full.startswith("http") and urlparse(full).netloc == urlparse(url).netloc:
+                        full = urljoin(current_url, a["href"]) # Use current_url for relative links
+                        if full.startswith("http") and urlparse(full).netloc == urlparse(current_url).netloc:
                             if self.is_allowed(full, rp):
                                 discovered.append(full)
+                                self.allowed_links.append(full)
+                            else:
+                                self.blocked_links.append(full)
 
                     if depth < 2:
                         targets = list(set(discovered))[:50]
@@ -153,7 +261,9 @@ class CrawlerService:
                         await queue.put((t, depth + 1, max_depth))
 
             except Exception as e:
-                await db_queue.put((session_id, url, "Error", str(e), depth, "failed"))
+                # Don't log error if it was just a stop
+                if not stop_event.is_set():
+                     await db_queue.put((session_id, url, "Error", str(e), depth, "failed"))
 
             queue.task_done()
 
@@ -161,29 +271,22 @@ class CrawlerService:
 
     # ---------------- ENTRY ---------------- #
 
-    async def crawl_url(self, url: str, save_folder: str = None, simulate: bool = False, recursive: bool = False, max_depth: int = 1) -> dict:
+    async def crawl_url(self, url: str, save_folder: str = None, simulate: bool = False, recursive: bool = False, max_depth: int = 1, stop_event: asyncio.Event = None) -> dict:
         """
-        Orchestrates the crawling process using a pool of worker tasks and a dedicated database writer.
-
-        Architecture:
-        - Uses a Producer-Consumer pattern where workers (Producer) fetch pages and push data to queues.
-        - `queue`: Holds URLs to be crawled.
-        - `db_queue`: Holds extracted data to be written to SQLite.
-        - `_db_writer`: A dedicated consumer task that writes to SQLite, ensuring the UI/crawler never blocks on I/O.
-
-        Args:
-            url (str): The seed URL to start crawling from.
-            save_folder (str, optional): Path to save JSON/TXT reports. Defaults to None.
-            simulate (bool): If True, runs headful browser to visualize the process. Defaults to False.
-            recursive (bool): If True, follows links within the same domain. Defaults to False.
-            max_depth (int): Maximum depth to traverse if recursive is True.
-
-        Returns:
-            dict: A summary report containing status, stats, and a preview of extracted content.
+        Orchestrates the crawling process with enhanced features.
         """
         
         start_time = datetime.now()
         session_id = str(uuid.uuid4())
+        
+        # Reset stats
+        self.allowed_links = []
+        self.blocked_links = []
+
+        # 1. URL Normalization
+        url = url.strip()
+        if not url.startswith("http"):
+            url = "https://" + url
 
         visited = set()
         visited_lock = asyncio.Lock()
@@ -191,18 +294,36 @@ class CrawlerService:
         queue = asyncio.Queue()
         db_queue = asyncio.Queue()
 
+        if stop_event is None:
+            stop_event = asyncio.Event()
+
         rp = self._get_robots_parser(url)
+        # Note: We check robots on the normalized URL
         if not self.is_allowed(url, rp):
-            return {"status": "blocked"}
+             self.blocked_links.append(url)
+             return {"status": "blocked", "error": "Disallowed by robots.txt", "links": {"allowed": [], "blocked": [url]}}
 
         queue.put_nowait((url, 0, max_depth if recursive else 0))
 
         async with async_playwright() as p:
 
-            browser = await p.chromium.launch(headless=not simulate)
+            # Optimized Launch Options
+            launch_options = {
+                "headless": not simulate,
+                "args": ["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"]
+            }
+            
+            browser = await p.chromium.launch(**launch_options)
 
-            NUM = 6
-            contexts = [await browser.new_context() for _ in range(NUM)]
+            # High Concurrency unless simulating
+            NUM = 15 if not simulate else 6 
+            
+            context_options = {}
+            if not simulate:
+                 # Add user agent to avoid basic blocks in headless
+                 context_options["user_agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+            contexts = [await browser.new_context(**context_options) for _ in range(NUM)]
 
             # Start DB writer
             db_task = asyncio.create_task(self._db_writer(db_queue))
@@ -210,14 +331,25 @@ class CrawlerService:
             workers = [
                 asyncio.create_task(
                     self._worker(i, queue, contexts[i], session_id,
-                                 rp, visited, visited_lock, db_queue, simulate)
+                                 rp, visited, visited_lock, db_queue, simulate, stop_event)
                 )
                 for i in range(NUM)
             ]
 
-            await queue.join()
+            # Custom join to support stop_event
+            # We wait for queue to be empty OR stop_event to be set
+            while not queue.empty() or (not stop_event.is_set() and len(visited) == 0): # Condition to wait needs to be robust
+                 if stop_event.is_set():
+                     break
+                 if queue.empty() and queue._unfinished_tasks == 0:
+                     break
+                 await asyncio.sleep(0.5)
+            
+            # If we are here, either queue is empty (done) or stopped
+            if not stop_event.is_set():
+                await queue.join()
 
-            # graceful shutdown
+            # Shutdown signals
             for _ in workers:
                 await queue.put(None)
 
@@ -238,15 +370,14 @@ class CrawlerService:
             duration = (end_time - start_time).total_seconds()
 
             # Prepare data
-            rows_data = [dict(r) for r in rows] # Convert sqlite3.Row to dict
+            rows_data = [dict(r) for r in rows] 
             
             # File Saving Logic
             saved_files = []
-            if save_folder:
+            if save_folder: # Fixed: Save even if stopped!
                 if not os.path.exists(save_folder):
                     os.makedirs(save_folder)
                 
-                # 1. Save Full Report (JSON)
                 report_path = os.path.join(save_folder, "crawl_report.json")
                 report_data = {
                     "url": url,
@@ -254,26 +385,33 @@ class CrawlerService:
                     "timestamp": start_time.isoformat(),
                     "duration_seconds": duration,
                     "pages_crawled": len(rows),
-                    "pages": rows_data
+                    "pages": rows_data,
+                    "links": {
+                        "allowed_sample": self.allowed_links[:100], 
+                        "blocked_sample": self.blocked_links[:100],
+                        "total_allowed": len(self.allowed_links),
+                        "total_blocked": len(self.blocked_links)
+                    }
                 }
                 with open(report_path, "w", encoding="utf-8") as f:
                     json.dump(report_data, f, indent=2)
                 saved_files.append(report_path)
 
-                # 2. Save Content (TXT)
                 content_path = os.path.join(save_folder, "crawled_content.txt")
                 with open(content_path, "w", encoding="utf-8") as f:
                     f.write(full)
                 saved_files.append(content_path)
 
+            status = "stopped" if stop_event.is_set() else "success"
+
             return {
                 "url": url,
-                "status": "success",
+                "status": status,
                 "session_id": session_id,
                 "pages_crawled": len(rows),
                 "full_text": full,
                 "content_preview": full[:500] + "...",
-                "links": {"allowed": [], "blocked": []},
+                "links": {"allowed": list(set(self.allowed_links)), "blocked": list(set(self.blocked_links))},
                 "duration": round(duration, 2),
                 "crawl_only_duration": round(duration, 2),
                 "saved_files": saved_files,
