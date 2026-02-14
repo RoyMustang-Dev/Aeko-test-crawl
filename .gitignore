@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# SQLite database
+crawler.db
+crawler.db-shm
+crawler.db-wal
+crawled_data.db
